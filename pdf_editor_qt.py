@@ -1,6 +1,7 @@
 """PyQt6 native PDF editor with PyMuPDF rendering."""
 import io
 import math
+import os
 import sys
 
 import fitz  # PyMuPDF
@@ -13,17 +14,118 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFileDialog, QFormLayout, QGroupBox, QLabel, QLineEdit,
+    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QPushButton, QScrollArea, QSpinBox, QSplitter,
     QStatusBar, QTextEdit, QToolBar, QVBoxLayout, QWidget,
 )
 
+USE_REMBG = False   # set False to skip rembg even if installed
+
 HIGHLIGHT_COLOR = QColor(255, 220, 0, 110)
 SELECTION_COLOR = QColor(100, 149, 237, 80)
-WM_HANDLE_R   = 6    # handle circle radius (px)
-WM_PADDING    = 4    # bounding-box padding (px)
-WM_ROT_OFFSET = 24   # pixels above bounding box for rotate handle
+WM_HANDLE_R    = 6
+WM_PADDING     = 4
+WM_ROT_OFFSET  = 24
+
+
+# ---------------------------------------------------------------------------
+# Watermark helpers
+# ---------------------------------------------------------------------------
+
+def _default_watermark() -> dict:
+    return {
+        "type":          "text",   # "text" | "image"
+        "text":          "",
+        "image_path":    "",
+        "image_pixmap":  None,     # QPixmap for display
+        "image_bytes":   None,     # PNG bytes for export
+        "x_pct":         0.5,
+        "y_pct":         0.5,
+        "fontsize":      48,       # pt (text) or display height in pt (image)
+        "angle":         45,
+        "visible":       True,
+    }
+
+
+def _process_watermark_image(path: str,
+                              opacity: float = 0.35) -> tuple:
+    """Load image, remove background, fade.
+    Returns (QPixmap, png_bytes, error_str).  error_str is None on success."""
+    try:
+        from PIL import Image as _PIL
+    except ImportError:
+        return None, None, "❌ 請安裝 Pillow: pip install Pillow"
+    try:
+        img = _PIL.open(path).convert("RGBA")
+
+        # --- background removal ---
+        if USE_REMBG:
+            try:
+                from rembg import remove as _rembg
+                img = _rembg(img)
+            except ImportError:
+                img = _remove_light_bg(img)
+        else:
+            img = _remove_light_bg(img)
+
+        # --- fade (scale alpha channel) ---
+        import numpy as _np
+        arr = _np.array(img, dtype=_np.float32)
+        arr[:, :, 3] = arr[:, :, 3] * opacity
+        import numpy as np
+        img = _PIL.fromarray(arr.astype(np.uint8))
+
+        # --- to QPixmap ---
+        data = img.tobytes("raw", "RGBA")
+        qimg = QImage(data, img.width, img.height,
+                      img.width * 4, QImage.Format.Format_RGBA8888)
+        pixmap = QPixmap.fromImage(qimg.copy())
+
+        # --- PNG bytes for export ---
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        img_bytes = buf.getvalue()
+
+        return pixmap, img_bytes, None
+    except Exception as exc:
+        return None, None, f"❌ 圖片處理失敗: {exc}"
+
+
+def _remove_light_bg(img):
+    """Threshold-based white background removal (Pillow fallback)."""
+    try:
+        import numpy as _np
+        arr = _np.array(img.convert("RGBA"))
+        lightness = arr[:, :, :3].mean(axis=2)
+        arr[:, :, 3] = _np.where(lightness > 200, 0, arr[:, :, 3])
+        from PIL import Image as _PIL
+        return _PIL.fromarray(arr)
+    except ImportError:
+        from PIL import Image as _PIL
+        img = img.convert("RGBA")
+        data = list(img.getdata())
+        img.putdata([
+            (r, g, b, 0) if (r + g + b) / 3 > 200 else (r, g, b, a)
+            for r, g, b, a in data
+        ])
+        return img
+
+
+def _rotate_image_bytes(img_bytes: bytes, angle: int) -> bytes:
+    """Rotate image (CCW-positive degrees) and return PNG bytes."""
+    if angle == 0:
+        return img_bytes
+    try:
+        from PIL import Image as _PIL
+        img = _PIL.open(io.BytesIO(img_bytes))
+        rotated = img.rotate(angle, expand=True,
+                             resample=_PIL.Resampling.BICUBIC)
+        buf = io.BytesIO()
+        rotated.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return img_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -31,11 +133,10 @@ WM_ROT_OFFSET = 24   # pixels above bounding box for rotate handle
 # ---------------------------------------------------------------------------
 
 class PageView(QWidget):
-    """Renders one PDF page; handles text selection and watermark interaction."""
-
-    selectionReady = pyqtSignal(str, list, QPoint)   # text, word_rects, global_pos
-    zoomRequested  = pyqtSignal(int)                  # +1 / -1
-    wmChanged      = pyqtSignal(float, float, int, int)  # x_pct, y_pct, fontsize, angle
+    selectionReady = pyqtSignal(str, list, QPoint)
+    zoomRequested  = pyqtSignal(int)
+    wmChanged      = pyqtSignal(int, float, float, int, int)  # idx,x,y,fs,ang
+    wmClicked      = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -45,28 +146,23 @@ class PageView(QWidget):
         self._highlights: list[dict] = []
         self._page_index: int = 0
 
-        # Word-level text selection
-        self._words:      list  = []
-        self._sel_start:  int   = -1
-        self._sel_end:    int   = -1
-        self._sel_active: bool  = False
+        self._words:      list = []
+        self._sel_start:  int  = -1
+        self._sel_end:    int  = -1
+        self._sel_active: bool = False
 
-        # Watermark overlay
-        self._wm_text:     str   = ""
-        self._wm_x_pct:    float = 0.5
-        self._wm_y_pct:    float = 0.5
-        self._wm_fontsize: int   = 48
-        self._wm_angle:    int   = 45
+        self._watermarks:    list[dict] = []
+        self._wm_active_idx: int = -1
+        self._wm_drag_idx:   int = -1
 
-        # Watermark drag state
-        self._wm_drag_mode:           str | None  = None   # 'move'|'resize'|'rotate'
-        self._wm_drag_origin:         QPointF | None = None
-        self._wm_drag_start_x_pct:    float = 0.5
-        self._wm_drag_start_y_pct:    float = 0.5
-        self._wm_drag_start_fontsize: int   = 48
-        self._wm_drag_start_angle:    int   = 45
-        self._wm_drag_start_scrangle: float = 0.0   # screen-angle at drag start
-        self._wm_drag_start_resize_lx: float = 1.0  # local-x of resize handle at start
+        self._wm_drag_mode:            str | None   = None
+        self._wm_drag_origin:          QPointF | None = None
+        self._wm_drag_start_x_pct:     float = 0.5
+        self._wm_drag_start_y_pct:     float = 0.5
+        self._wm_drag_start_fontsize:  int   = 48
+        self._wm_drag_start_angle:     int   = 45
+        self._wm_drag_start_scrangle:  float = 0.0
+        self._wm_drag_start_resize_lx: float = 1.0
 
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.IBeamCursor)
@@ -90,13 +186,10 @@ class PageView(QWidget):
         self._highlights = highlights
         self.update()
 
-    def set_watermark(self, text: str, x_pct: float, y_pct: float,
-                      fontsize: int, angle: int) -> None:
-        self._wm_text     = text
-        self._wm_x_pct    = x_pct
-        self._wm_y_pct    = y_pct
-        self._wm_fontsize = fontsize
-        self._wm_angle    = angle
+    def set_watermarks(self, watermarks: list[dict],
+                       active_idx: int = -1) -> None:
+        self._watermarks    = list(watermarks)
+        self._wm_active_idx = active_idx
         self.update()
 
     # ------------------------------------------------------------------
@@ -123,19 +216,27 @@ class PageView(QWidget):
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
+
+        # 1. Page content
         if self._pixmap:
+            painter.setCompositionMode(
+                QPainter.CompositionMode.CompositionMode_SourceOver)
             painter.drawPixmap(0, 0, self._pixmap)
+
+        # 2. Watermarks — Multiply keeps dark text intact, tints white areas
+        if self._watermarks:
+            self._paint_all_watermarks(painter)
 
         painter.setCompositionMode(
             QPainter.CompositionMode.CompositionMode_SourceOver)
 
-        # Stored highlights
+        # 3. Highlights
         for hl in self._highlights:
             if hl["page"] == self._page_index:
                 painter.fillRect(self._pdf_to_screen(hl["rect"]),
                                  HIGHLIGHT_COLOR)
 
-        # Text selection
+        # 4. Text selection
         if self._sel_start >= 0 and self._sel_end >= 0:
             lo, hi = sorted((self._sel_start, self._sel_end))
             for i in range(lo, hi + 1):
@@ -143,35 +244,93 @@ class PageView(QWidget):
                     self._pdf_to_screen(fitz.Rect(self._words[i][:4])),
                     SELECTION_COLOR)
 
-        # Watermark overlay
-        if self._wm_text:
-            self._paint_watermark(painter)
+        # 5. Bounding-box / handles overlay (always on top)
+        if self._watermarks:
+            self._paint_wm_handles(painter)
 
         painter.end()
 
-    def _paint_watermark(self, painter: QPainter) -> None:
-        text_w, text_h = self._wm_size()
-        p = WM_PADDING
-        ax = self._wm_x_pct * self.width()
-        ay = self._wm_y_pct * self.height()
+    def _paint_all_watermarks(self, painter: QPainter) -> None:
+        """Paint watermark content (text or image) — drawn before page pixmap."""
+        for idx, wm in enumerate(self._watermarks):
+            if not wm.get("visible", True):
+                continue
+            if wm["type"] == "image":
+                pm = wm.get("image_pixmap")
+                if pm is None:
+                    continue
+                self._paint_image_wm(painter, wm)
+            else:
+                if not wm["text"].strip():
+                    continue
+                self._paint_text_wm(painter, wm)
+
+    def _paint_text_wm(self, painter: QPainter, wm: dict) -> None:
+        text_w, text_h = self._wm_size_for(wm)
+        ax = wm["x_pct"] * self.width()
+        ay = wm["y_pct"] * self.height()
 
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.translate(ax, ay)
-        painter.rotate(-self._wm_angle)   # Qt CW → negate for CCW (PyMuPDF convention)
+        painter.rotate(-wm["angle"])
 
-        # Text (semi-transparent grey)
-        painter.setOpacity(0.40)
-        painter.setFont(self._wm_qfont())
-        painter.setPen(QColor(180, 180, 180))
+        # Multiply: text "tints" light areas but never covers dark ink
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_Multiply)
+        painter.setOpacity(1.0)
+        painter.setFont(self._wm_qfont_for(wm))
+        painter.setPen(QColor(160, 160, 160))
         painter.drawText(
             QRectF(-text_w / 2, -text_h / 2, text_w, text_h),
             Qt.AlignmentFlag.AlignCenter,
-            self._wm_text,
+            wm["text"],
         )
-        painter.setOpacity(1.0)
+        painter.restore()
 
-        # Dashed bounding box
+    def _paint_image_wm(self, painter: QPainter, wm: dict) -> None:
+        pm = wm["image_pixmap"]
+        text_w, text_h = self._wm_size_for(wm)
+        ax = wm["x_pct"] * self.width()
+        ay = wm["y_pct"] * self.height()
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.translate(ax, ay)
+        painter.rotate(-wm["angle"])
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.drawPixmap(
+            round(-text_w / 2), round(-text_h / 2),
+            round(text_w), round(text_h),
+            pm)
+        painter.restore()
+
+    def _paint_wm_handles(self, painter: QPainter) -> None:
+        """Paint bounding box + drag handles for the active watermark only."""
+        idx = self._wm_active_idx
+        if idx < 0 or idx >= len(self._watermarks):
+            return
+        wm = self._watermarks[idx]
+        if not wm.get("visible", True):
+            return
+        if wm["type"] == "image" and wm.get("image_pixmap") is None:
+            return
+        if wm["type"] == "text" and not wm["text"].strip():
+            return
+
+        text_w, text_h = self._wm_size_for(wm)
+        p = WM_PADDING
+        ax = wm["x_pct"] * self.width()
+        ay = wm["y_pct"] * self.height()
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.translate(ax, ay)
+        painter.rotate(-wm["angle"])
+
         box = QRectF(-text_w / 2 - p, -text_h / 2 - p,
                      text_w + p * 2, text_h + p * 2)
         painter.setPen(QPen(QColor(100, 149, 237, 180), 1,
@@ -179,13 +338,11 @@ class PageView(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(box)
 
-        # Resize handle – right-centre of box (blue)
         rh = QPointF(box.right(), 0.0)
         painter.setPen(QPen(QColor(100, 149, 237)))
         painter.setBrush(QColor(100, 149, 237))
         painter.drawEllipse(rh, WM_HANDLE_R, WM_HANDLE_R)
 
-        # Rotate handle – above top-centre (orange)
         rot_y = box.top() - WM_ROT_OFFSET
         rot_h = QPointF(0.0, rot_y)
         painter.setPen(QPen(QColor(255, 140, 0)))
@@ -204,32 +361,32 @@ class PageView(QWidget):
             return
         pos = event.position().toPoint()
 
-        # Watermark interaction takes priority
-        if self._wm_text:
-            hit = self._wm_hit_test(pos)
-            if hit:
+        if self._watermarks:
+            wm_idx, hit = self._wm_hit_test(pos)
+            if hit is not None:
+                wm = self._watermarks[wm_idx]
+                self._wm_drag_idx           = wm_idx
                 self._wm_drag_mode          = hit
                 self._wm_drag_origin        = event.position()
-                self._wm_drag_start_x_pct   = self._wm_x_pct
-                self._wm_drag_start_y_pct   = self._wm_y_pct
-                self._wm_drag_start_fontsize = self._wm_fontsize
-                self._wm_drag_start_angle   = self._wm_angle
-
-                ax = self._wm_x_pct * self.width()
-                ay = self._wm_y_pct * self.height()
+                self._wm_drag_start_x_pct   = wm["x_pct"]
+                self._wm_drag_start_y_pct   = wm["y_pct"]
+                self._wm_drag_start_fontsize = wm["fontsize"]
+                self._wm_drag_start_angle   = wm["angle"]
+                ax = wm["x_pct"] * self.width()
+                ay = wm["y_pct"] * self.height()
                 self._wm_drag_start_scrangle = math.degrees(
                     math.atan2(event.position().y() - ay,
                                event.position().x() - ax))
-
                 if hit == 'resize':
-                    inv, _ = self._wm_transform().inverted()
+                    inv, _ = self._wm_transform_for(wm).inverted()
                     self._wm_drag_start_resize_lx = max(
                         1.0, abs(inv.map(event.position()).x()))
-
+                if wm_idx != self._wm_active_idx:
+                    self._wm_active_idx = wm_idx
+                    self.wmClicked.emit(wm_idx)
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 return
 
-        # Text selection
         idx = self._word_at(pos)
         self._sel_start = self._sel_end = idx
         self._sel_active = True
@@ -239,17 +396,14 @@ class PageView(QWidget):
         if self._wm_drag_mode:
             self._handle_wm_drag(event.position())
             return
-
         if self._sel_active:
             idx = self._word_at(event.position().toPoint())
             if idx != self._sel_end:
                 self._sel_end = idx
                 self.update()
             return
-
-        # Hover cursor
-        if self._wm_text:
-            hit = self._wm_hit_test(event.position().toPoint())
+        if self._watermarks:
+            _, hit = self._wm_hit_test(event.position().toPoint())
             cursors = {
                 'move':   Qt.CursorShape.SizeAllCursor,
                 'resize': Qt.CursorShape.SizeHorCursor,
@@ -262,17 +416,16 @@ class PageView(QWidget):
     def mouseReleaseEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
             return
-
         if self._wm_drag_mode:
             self._wm_drag_mode = None
+            self._wm_drag_idx  = -1
             self.setCursor(Qt.CursorShape.IBeamCursor)
             return
-
         if self._sel_active:
             self._sel_active = False
             lo, hi = sorted((self._sel_start, self._sel_end))
             if lo >= 0 and hi >= 0:
-                sel = self._words[lo:hi + 1]
+                sel  = self._words[lo:hi + 1]
                 text = " ".join(w[4] for w in sel)
                 rects = [fitz.Rect(w[:4]) for w in sel]
                 if text.strip():
@@ -297,89 +450,114 @@ class PageView(QWidget):
     # ------------------------------------------------------------------
 
     def _handle_wm_drag(self, pos: QPointF) -> None:
+        idx = self._wm_drag_idx
+        if idx < 0 or idx >= len(self._watermarks):
+            return
+        wm = self._watermarks[idx]
+
         if self._wm_drag_mode == 'move':
             dx = (pos.x() - self._wm_drag_origin.x()) / self.width()
             dy = (pos.y() - self._wm_drag_origin.y()) / self.height()
-            nx = max(0.0, min(1.0, self._wm_drag_start_x_pct + dx))
-            ny = max(0.0, min(1.0, self._wm_drag_start_y_pct + dy))
-            self._wm_x_pct = nx
-            self._wm_y_pct = ny
-            self.wmChanged.emit(nx, ny, self._wm_fontsize, self._wm_angle)
+            wm["x_pct"] = max(0.0, min(1.0, self._wm_drag_start_x_pct + dx))
+            wm["y_pct"] = max(0.0, min(1.0, self._wm_drag_start_y_pct + dy))
+            self.wmChanged.emit(idx, wm["x_pct"], wm["y_pct"],
+                                wm["fontsize"], wm["angle"])
 
         elif self._wm_drag_mode == 'resize':
-            inv, _ = self._wm_transform().inverted()
+            inv, _ = self._wm_transform_for(wm).inverted()
             local_x = abs(inv.map(pos).x())
             scale = max(0.05, local_x / self._wm_drag_start_resize_lx)
-            nfs = max(6, min(300, round(self._wm_drag_start_fontsize * scale)))
-            self._wm_fontsize = nfs
-            self.wmChanged.emit(self._wm_x_pct, self._wm_y_pct,
-                                nfs, self._wm_angle)
+            wm["fontsize"] = max(6, min(300,
+                                        round(self._wm_drag_start_fontsize * scale)))
+            self.wmChanged.emit(idx, wm["x_pct"], wm["y_pct"],
+                                wm["fontsize"], wm["angle"])
 
         elif self._wm_drag_mode == 'rotate':
-            ax = self._wm_x_pct * self.width()
-            ay = self._wm_y_pct * self.height()
+            ax = wm["x_pct"] * self.width()
+            ay = wm["y_pct"] * self.height()
             cur_scr = math.degrees(math.atan2(pos.y() - ay, pos.x() - ax))
             delta = cur_scr - self._wm_drag_start_scrangle
-            # Screen CW delta → CCW in PDF convention → subtract
             na = round(self._wm_drag_start_angle - delta) % 360
             if na > 180:
                 na -= 360
-            self._wm_angle = na
-            self.wmChanged.emit(self._wm_x_pct, self._wm_y_pct,
-                                self._wm_fontsize, na)
-
+            wm["angle"] = na
+            self.wmChanged.emit(idx, wm["x_pct"], wm["y_pct"],
+                                wm["fontsize"], na)
         self.update()
 
     # ------------------------------------------------------------------
     # Watermark helpers
     # ------------------------------------------------------------------
 
-    def _wm_qfont(self) -> QFont:
+    def _wm_qfont_for(self, wm: dict) -> QFont:
         font = QFont("Helvetica")
-        font.setPixelSize(max(1, round(self._wm_fontsize * self._zoom)))
+        font.setPixelSize(max(1, round(wm["fontsize"] * self._zoom)))
         return font
 
-    def _wm_size(self) -> tuple[float, float]:
-        """Returns (text_w, text_h) in screen pixels."""
-        fm = QFontMetricsF(self._wm_qfont())
-        return fm.horizontalAdvance(self._wm_text), fm.height()
+    def _wm_size_for(self, wm: dict) -> tuple[float, float]:
+        if wm["type"] == "image":
+            pm = wm.get("image_pixmap")
+            if pm and pm.height() > 0:
+                h = wm["fontsize"] * self._zoom
+                w = h * pm.width() / pm.height()
+                return w, h
+            return wm["fontsize"] * self._zoom, wm["fontsize"] * self._zoom
+        fm = QFontMetricsF(self._wm_qfont_for(wm))
+        t  = wm["text"].strip() or " "
+        return fm.horizontalAdvance(t), fm.height()
 
-    def _wm_transform(self) -> QTransform:
-        """Maps watermark local coords → screen coords."""
+    def _wm_transform_for(self, wm: dict) -> QTransform:
         t = QTransform()
-        t.translate(self._wm_x_pct * self.width(),
-                    self._wm_y_pct * self.height())
-        t.rotate(-self._wm_angle)
+        t.translate(wm["x_pct"] * self.width(), wm["y_pct"] * self.height())
+        t.rotate(-wm["angle"])
         return t
 
-    def _wm_hit_test(self, screen_pos: QPoint) -> str | None:
-        if not self._wm_text:
+    def _wm_hit_test_one(self, screen_pos: QPoint, wm: dict,
+                         check_handles: bool = True) -> str | None:
+        if not wm.get("visible", True):
             return None
-        text_w, text_h = self._wm_size()
-        p = WM_PADDING
+        if wm["type"] == "image":
+            if wm.get("image_pixmap") is None:
+                return None
+        else:
+            if not wm["text"].strip():
+                return None
 
-        inv, ok = self._wm_transform().inverted()
+        text_w, text_h = self._wm_size_for(wm)
+        p = WM_PADDING
+        inv, ok = self._wm_transform_for(wm).inverted()
         if not ok:
             return None
         loc = inv.map(QPointF(screen_pos))
         lx, ly = loc.x(), loc.y()
 
-        # Rotate handle
-        rot_y = -(text_h / 2 + p + WM_ROT_OFFSET)
-        if math.hypot(lx, ly - rot_y) <= WM_HANDLE_R + 4:
-            return 'rotate'
+        if check_handles:
+            rot_y = -(text_h / 2 + p + WM_ROT_OFFSET)
+            if math.hypot(lx, ly - rot_y) <= WM_HANDLE_R + 4:
+                return 'rotate'
+            rh_x = text_w / 2 + p
+            if math.hypot(lx - rh_x, ly) <= WM_HANDLE_R + 4:
+                return 'resize'
 
-        # Resize handle (right-centre)
-        rh_x = text_w / 2 + p
-        if math.hypot(lx - rh_x, ly) <= WM_HANDLE_R + 4:
-            return 'resize'
-
-        # Body
         if (-text_w / 2 - p <= lx <= text_w / 2 + p and
                 -text_h / 2 - p <= ly <= text_h / 2 + p):
             return 'move'
-
         return None
+
+    def _wm_hit_test(self, screen_pos: QPoint) -> tuple:
+        if 0 <= self._wm_active_idx < len(self._watermarks):
+            hit = self._wm_hit_test_one(
+                screen_pos, self._watermarks[self._wm_active_idx],
+                check_handles=True)
+            if hit:
+                return self._wm_active_idx, hit
+        for idx, wm in enumerate(self._watermarks):
+            if idx == self._wm_active_idx:
+                continue
+            hit = self._wm_hit_test_one(screen_pos, wm, check_handles=False)
+            if hit:
+                return idx, hit
+        return None, None
 
     # ------------------------------------------------------------------
     # Coordinate helpers
@@ -412,7 +590,6 @@ class PageView(QWidget):
 # Translation backend
 # ---------------------------------------------------------------------------
 
-# Maps display name → (deepl_code, google_code, gemini_name)
 _LANGUAGES: dict[str, tuple[str, str, str]] = {
     "Chinese (Traditional)": ("ZH",    "zh-TW", "Traditional Chinese"),
     "Chinese (Simplified)":  ("ZH",    "zh-CN", "Simplified Chinese"),
@@ -427,37 +604,29 @@ _LANGUAGES: dict[str, tuple[str, str, str]] = {
 PROVIDERS = ["Gemini", "DeepL", "Google Translate", "Mock (offline)"]
 
 GEMINI_MODELS = [
-    "gemini-2.5-flash",      # recommended — best free tier balance
-    "gemini-2.5-flash-lite", # lightest 2.5
-    "gemini-2.0-flash",      # stable 2.0
-    "gemini-2.0-flash-lite", # lite 2.0
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
 ]
 
 
 def _friendly_gemini_error(exc: Exception) -> str:
-    """Turn a Gemini API exception into a short, readable message."""
-    msg = str(exc)
-    # Extract retry delay if present
     import re
+    msg = str(exc)
     m = re.search(r'retry_delay\s*\{\s*seconds:\s*(\d+)', msg)
     retry = f"  Retry in {m.group(1)} s." if m else ""
-    # Quota exceeded
     if "429" in msg or "quota" in msg.lower():
         return f"❌ Gemini quota exceeded.{retry}"
-    # API key invalid
     if "400" in msg or "API_KEY" in msg:
         return "❌ Invalid Gemini API key."
-    # Generic fallback — first line only
-    first_line = msg.splitlines()[0][:120]
-    return f"❌ Gemini error: {first_line}"
+    return f"❌ Gemini error: {msg.splitlines()[0][:120]}"
 
 
 def translate(text: str, provider: str, api_key: str,
               target_lang: str, model: str = "gemini-2.5-flash") -> str:
-    """Call the selected translation provider and return the translated string."""
     if provider == "Mock (offline)" or not text.strip():
         return f"[TRANSLATED] {text}"
-
     lang_info = _LANGUAGES.get(target_lang, _LANGUAGES["English"])
 
     if provider == "Gemini":
@@ -470,15 +639,11 @@ def translate(text: str, provider: str, api_key: str,
             return "❌ Please enter a Gemini API key."
         try:
             client = _genai.Client(api_key=api_key)
-            prompt = (
-                f"Translate the following text to {lang_info[2]}. "
-                f"Return only the translation, no explanation:\n\n{text}"
-            )
+            prompt = (f"Translate the following text to {lang_info[2]}. "
+                      f"Return only the translation, no explanation:\n\n{text}")
             resp = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=_types.GenerateContentConfig(temperature=0.2),
-            )
+                model=model, contents=prompt,
+                config=_types.GenerateContentConfig(temperature=0.2))
             return resp.text.strip()
         except Exception as exc:
             return _friendly_gemini_error(exc)
@@ -490,8 +655,8 @@ def translate(text: str, provider: str, api_key: str,
             return "❌ Package missing — run: pip install deepl"
         if not api_key:
             return "❌ Please enter a DeepL API key."
-        translator = _deepl.Translator(api_key)
-        return translator.translate_text(text, target_lang=lang_info[0]).text
+        return _deepl.Translator(api_key).translate_text(
+            text, target_lang=lang_info[0]).text
 
     elif provider == "Google Translate":
         try:
@@ -504,8 +669,7 @@ def translate(text: str, provider: str, api_key: str,
             "https://translation.googleapis.com/language/translate/v2",
             params={"key": api_key},
             json={"q": text, "target": lang_info[1]},
-            timeout=15,
-        )
+            timeout=15)
         resp.raise_for_status()
         return resp.json()["data"]["translations"][0]["translatedText"]
 
@@ -541,7 +705,6 @@ class TranslateDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        # Run translation (synchronous — dialog shows "Translating…" first)
         QApplication.processEvents()
         try:
             result = translate(original, provider, api_key, target_lang, model)
@@ -560,10 +723,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("PDF Editor")
         self.resize(1200, 800)
 
-        self._doc:          fitz.Document | None = None
-        self._current_page: int   = 0
-        self._zoom:         float = 1.0
-        self._highlights:   list[dict] = []
+        self._doc:           fitz.Document | None = None
+        self._current_page:  int   = 0
+        self._zoom:          float = 1.0
+        self._highlights:    list[dict] = []
+        self._watermarks:    list[dict] = []
+        self._wm_active_idx: int = -1
 
         self._build_ui()
         self._apply_dark_theme()
@@ -581,7 +746,6 @@ class MainWindow(QMainWindow):
         open_act.setShortcut("Ctrl+O")
         open_act.triggered.connect(self._open_pdf)
         toolbar.addAction(open_act)
-
         toolbar.addSeparator()
 
         prev_act = QAction("◀  Prev", self)
@@ -596,7 +760,6 @@ class MainWindow(QMainWindow):
         next_act.setShortcut("Right")
         next_act.triggered.connect(self._next_page)
         toolbar.addAction(next_act)
-
         toolbar.addSeparator()
 
         toolbar.addWidget(QLabel("  Zoom: "))
@@ -607,7 +770,6 @@ class MainWindow(QMainWindow):
         self._zoom_spin.setSuffix("×")
         self._zoom_spin.valueChanged.connect(self._change_zoom)
         toolbar.addWidget(self._zoom_spin)
-
         toolbar.addSeparator()
 
         export_act = QAction("Export PDF", self)
@@ -615,7 +777,6 @@ class MainWindow(QMainWindow):
         export_act.triggered.connect(self._export_pdf)
         toolbar.addAction(export_act)
 
-        # Central splitter
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.setCentralWidget(splitter)
 
@@ -627,13 +788,13 @@ class MainWindow(QMainWindow):
         self._page_view.selectionReady.connect(self._on_selection)
         self._page_view.zoomRequested.connect(self._on_zoom_request)
         self._page_view.wmChanged.connect(self._on_wm_changed)
+        self._page_view.wmClicked.connect(self._on_wm_clicked)
         self._scroll.setWidget(self._page_view)
         splitter.addWidget(self._scroll)
 
         sidebar = self._build_sidebar()
         sidebar.setFixedWidth(240)
         splitter.addWidget(sidebar)
-
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
 
@@ -646,49 +807,108 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        # ---- Watermark ----
-        wm_group = QGroupBox("Watermark")
+        # ---- Watermarks ----
+        wm_group = QGroupBox("Watermarks")
         wm_layout = QVBoxLayout(wm_group)
 
-        self._wm_input = QLineEdit()
-        self._wm_input.setPlaceholderText("Watermark text…")
-        self._wm_input.textChanged.connect(self._update_wm_preview)
-        wm_layout.addWidget(self._wm_input)
+        self._wm_list = QListWidget()
+        self._wm_list.setMaximumHeight(110)
+        self._wm_list.currentRowChanged.connect(self._on_wm_list_row_changed)
+        self._wm_list.itemChanged.connect(self._on_wm_item_changed)
+        wm_layout.addWidget(self._wm_list)
 
-        form = QFormLayout()
-        form.setHorizontalSpacing(6)
-        form.setVerticalSpacing(4)
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("+ Add")
+        add_btn.clicked.connect(self._add_watermark)
+        btn_row.addWidget(add_btn)
+        del_btn = QPushButton("Delete")
+        del_btn.clicked.connect(self._delete_watermark)
+        btn_row.addWidget(del_btn)
+        wm_layout.addLayout(btn_row)
+
+        # --- Properties form (enabled only when a watermark is selected) ---
+        self._wm_props = QWidget()
+        props_layout = QVBoxLayout(self._wm_props)
+        props_layout.setContentsMargins(0, 4, 0, 0)
+        props_layout.setSpacing(4)
+
+        # Type selector
+        type_row = QFormLayout()
+        type_row.setHorizontalSpacing(6)
+        self._wm_type = QComboBox()
+        self._wm_type.addItems(["文字", "圖片"])
+        self._wm_type.currentIndexChanged.connect(self._on_wm_type_changed)
+        type_row.addRow("類型:", self._wm_type)
+        props_layout.addLayout(type_row)
+
+        # Text section
+        self._wm_text_section = QWidget()
+        ts_layout = QVBoxLayout(self._wm_text_section)
+        ts_layout.setContentsMargins(0, 0, 0, 0)
+        ts_layout.setSpacing(2)
+        ts_layout.addWidget(QLabel("文字:"))
+        self._wm_input = QLineEdit()
+        self._wm_input.setPlaceholderText("浮水印文字…")
+        self._wm_input.textChanged.connect(self._update_active_wm)
+        ts_layout.addWidget(self._wm_input)
+        props_layout.addWidget(self._wm_text_section)
+
+        # Image section
+        self._wm_image_section = QWidget()
+        is_layout = QVBoxLayout(self._wm_image_section)
+        is_layout.setContentsMargins(0, 0, 0, 0)
+        is_layout.setSpacing(2)
+        self._wm_image_btn = QPushButton("選擇圖片…")
+        self._wm_image_btn.clicked.connect(self._browse_wm_image)
+        is_layout.addWidget(self._wm_image_btn)
+        self._wm_image_path_label = QLabel("(未選擇)")
+        self._wm_image_path_label.setWordWrap(True)
+        is_layout.addWidget(self._wm_image_path_label)
+        props_layout.addWidget(self._wm_image_section)
+        self._wm_image_section.setVisible(False)
+
+        # Common fields
+        common = QFormLayout()
+        common.setHorizontalSpacing(6)
+        common.setVerticalSpacing(4)
 
         self._wm_fontsize = QSpinBox()
         self._wm_fontsize.setRange(6, 300)
         self._wm_fontsize.setValue(48)
         self._wm_fontsize.setSuffix(" pt")
-        self._wm_fontsize.valueChanged.connect(self._update_wm_preview)
-        form.addRow("Size:", self._wm_fontsize)
+        self._wm_fontsize.valueChanged.connect(self._update_active_wm)
+        common.addRow("大小:", self._wm_fontsize)
 
         self._wm_x = QSpinBox()
         self._wm_x.setRange(0, 100)
         self._wm_x.setValue(50)
         self._wm_x.setSuffix(" %")
-        self._wm_x.valueChanged.connect(self._update_wm_preview)
-        form.addRow("X:", self._wm_x)
+        self._wm_x.valueChanged.connect(self._update_active_wm)
+        common.addRow("X:", self._wm_x)
 
         self._wm_y = QSpinBox()
         self._wm_y.setRange(0, 100)
         self._wm_y.setValue(50)
         self._wm_y.setSuffix(" %")
-        self._wm_y.valueChanged.connect(self._update_wm_preview)
-        form.addRow("Y:", self._wm_y)
+        self._wm_y.valueChanged.connect(self._update_active_wm)
+        common.addRow("Y:", self._wm_y)
 
         self._wm_angle = QSpinBox()
         self._wm_angle.setRange(-180, 180)
         self._wm_angle.setValue(45)
         self._wm_angle.setSuffix(" °")
-        self._wm_angle.valueChanged.connect(self._update_wm_preview)
-        form.addRow("Angle:", self._wm_angle)
+        self._wm_angle.valueChanged.connect(self._update_active_wm)
+        common.addRow("角度:", self._wm_angle)
 
-        wm_layout.addLayout(form)
-        wm_layout.addWidget(QLabel("Drag on page to reposition.\nExported to every page."))
+        props_layout.addLayout(common)
+        wm_layout.addWidget(self._wm_props)
+
+        # Disable all form inputs initially
+        for w in self._wm_editable_widgets():
+            w.setEnabled(False)
+
+        wm_layout.addWidget(
+            QLabel("拖曳頁面可調整位置。\n匯出時套用至每一頁。"))
         layout.addWidget(wm_group)
 
         # ---- Translation ----
@@ -717,7 +937,6 @@ class MainWindow(QMainWindow):
         tr_layout.addRow("Target:", self._tr_lang)
 
         layout.addWidget(tr_group)
-        # Sync initial visibility
         self._on_provider_changed(self._tr_provider.currentText())
 
         # ---- Highlights ----
@@ -726,13 +945,23 @@ class MainWindow(QMainWindow):
         self._hl_list = QListWidget()
         self._hl_list.itemDoubleClicked.connect(self._jump_to_highlight)
         hl_layout.addWidget(self._hl_list)
-        del_btn = QPushButton("Delete Selected")
-        del_btn.clicked.connect(self._delete_highlight)
-        hl_layout.addWidget(del_btn)
+        del_hl_btn = QPushButton("Delete Selected")
+        del_hl_btn.clicked.connect(self._delete_highlight)
+        hl_layout.addWidget(del_hl_btn)
         layout.addWidget(hl_group)
 
         layout.addStretch()
         return container
+
+    def _wm_editable_widgets(self):
+        """Widgets to enable/disable based on whether a watermark is selected."""
+        return (self._wm_type, self._wm_input, self._wm_image_btn,
+                self._wm_fontsize, self._wm_x, self._wm_y, self._wm_angle)
+
+    def _wm_signal_widgets(self):
+        """Widgets whose signals to block during programmatic value updates."""
+        return (self._wm_type, self._wm_input,
+                self._wm_fontsize, self._wm_x, self._wm_y, self._wm_angle)
 
     # ------------------------------------------------------------------
     # Translation provider
@@ -744,30 +973,167 @@ class MainWindow(QMainWindow):
         self._tr_model.setVisible(gemini)
 
     # ------------------------------------------------------------------
-    # Watermark preview sync
+    # Watermark list management
     # ------------------------------------------------------------------
 
-    def _update_wm_preview(self) -> None:
-        self._page_view.set_watermark(
-            self._wm_input.text().strip(),
-            self._wm_x.value() / 100.0,
-            self._wm_y.value() / 100.0,
-            self._wm_fontsize.value(),
-            self._wm_angle.value(),
-        )
+    def _add_watermark(self) -> None:
+        wm = _default_watermark()
+        self._watermarks.append(wm)
+        idx = len(self._watermarks) - 1
+        item = QListWidgetItem(f"Watermark {idx + 1}")
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked)
+        self._wm_list.blockSignals(True)
+        self._wm_list.addItem(item)
+        self._wm_list.blockSignals(False)
+        self._wm_list.setCurrentRow(idx)
 
-    def _on_wm_changed(self, x_pct: float, y_pct: float,
-                       fontsize: int, angle: int) -> None:
-        """PageView dragged the watermark — sync sidebar widgets."""
-        widgets = (self._wm_x, self._wm_y, self._wm_fontsize, self._wm_angle)
-        for w in widgets:
+    def _delete_watermark(self) -> None:
+        idx = self._wm_active_idx
+        if idx < 0 or idx >= len(self._watermarks):
+            return
+        del self._watermarks[idx]
+        self._wm_list.blockSignals(True)
+        self._wm_list.takeItem(idx)
+        self._wm_list.blockSignals(False)
+        for i in range(idx, self._wm_list.count()):
+            self._refresh_wm_list_item(i)
+        new_idx = min(idx, len(self._watermarks) - 1)
+        if new_idx >= 0:
+            self._wm_list.setCurrentRow(new_idx)
+        else:
+            self._wm_active_idx = -1
+            for w in self._wm_editable_widgets():
+                w.setEnabled(False)
+            self._wm_text_section.setVisible(False)
+            self._wm_image_section.setVisible(False)
+            self._page_view.set_watermarks(self._watermarks, -1)
+
+    def _refresh_wm_list_item(self, idx: int) -> None:
+        item = self._wm_list.item(idx)
+        if item is None or idx >= len(self._watermarks):
+            return
+        wm = self._watermarks[idx]
+        if wm["type"] == "image":
+            path = wm.get("image_path", "")
+            label = os.path.basename(path) if path else f"Watermark {idx + 1}"
+        else:
+            text = wm["text"].strip()
+            label = text if text else f"Watermark {idx + 1}"
+        self._wm_list.blockSignals(True)
+        item.setText(label)
+        item.setCheckState(
+            Qt.CheckState.Checked if wm.get("visible", True)
+            else Qt.CheckState.Unchecked)
+        self._wm_list.blockSignals(False)
+
+    def _on_wm_item_changed(self, item: QListWidgetItem) -> None:
+        """Checkbox toggled — update visibility."""
+        row = self._wm_list.row(item)
+        if 0 <= row < len(self._watermarks):
+            self._watermarks[row]["visible"] = (
+                item.checkState() == Qt.CheckState.Checked)
+            self._page_view.set_watermarks(self._watermarks, self._wm_active_idx)
+
+    def _on_wm_list_row_changed(self, row: int) -> None:
+        self._wm_active_idx = row
+        if row < 0 or row >= len(self._watermarks):
+            for w in self._wm_editable_widgets():
+                w.setEnabled(False)
+            self._wm_text_section.setVisible(False)
+            self._wm_image_section.setVisible(False)
+            self._page_view.set_watermarks(self._watermarks, -1)
+            return
+
+        wm = self._watermarks[row]
+        for w in self._wm_editable_widgets():
+            w.setEnabled(True)
+
+        is_text = (wm["type"] == "text")
+        self._wm_text_section.setVisible(is_text)
+        self._wm_image_section.setVisible(not is_text)
+
+        for w in self._wm_signal_widgets():
             w.blockSignals(True)
-        self._wm_x.setValue(round(x_pct * 100))
-        self._wm_y.setValue(round(y_pct * 100))
-        self._wm_fontsize.setValue(fontsize)
-        self._wm_angle.setValue(angle)
-        for w in widgets:
+        self._wm_type.setCurrentIndex(0 if is_text else 1)
+        self._wm_input.setText(wm["text"])
+        self._wm_fontsize.setValue(wm["fontsize"])
+        self._wm_x.setValue(round(wm["x_pct"] * 100))
+        self._wm_y.setValue(round(wm["y_pct"] * 100))
+        self._wm_angle.setValue(wm["angle"])
+        for w in self._wm_signal_widgets():
             w.blockSignals(False)
+
+        path = wm.get("image_path", "")
+        self._wm_image_path_label.setText(
+            os.path.basename(path) if path else "(未選擇)")
+
+        self._page_view.set_watermarks(self._watermarks, row)
+
+    def _on_wm_type_changed(self, index: int) -> None:
+        is_text = (index == 0)
+        self._wm_text_section.setVisible(is_text)
+        self._wm_image_section.setVisible(not is_text)
+        self._update_active_wm()
+
+    def _update_active_wm(self) -> None:
+        idx = self._wm_active_idx
+        if idx < 0 or idx >= len(self._watermarks):
+            return
+        wm = self._watermarks[idx]
+        wm["type"]    = "text" if self._wm_type.currentIndex() == 0 else "image"
+        wm["text"]    = self._wm_input.text()
+        wm["fontsize"] = self._wm_fontsize.value()
+        wm["x_pct"]   = self._wm_x.value() / 100.0
+        wm["y_pct"]   = self._wm_y.value() / 100.0
+        wm["angle"]   = self._wm_angle.value()
+        self._refresh_wm_list_item(idx)
+        self._page_view.set_watermarks(self._watermarks, idx)
+
+    def _on_wm_changed(self, idx: int, x_pct: float, y_pct: float,
+                       fontsize: int, angle: int) -> None:
+        if idx < 0 or idx >= len(self._watermarks):
+            return
+        wm = self._watermarks[idx]
+        wm["x_pct"]    = x_pct
+        wm["y_pct"]    = y_pct
+        wm["fontsize"] = fontsize
+        wm["angle"]    = angle
+        if idx == self._wm_active_idx:
+            for w in (self._wm_x, self._wm_y, self._wm_fontsize, self._wm_angle):
+                w.blockSignals(True)
+            self._wm_x.setValue(round(x_pct * 100))
+            self._wm_y.setValue(round(y_pct * 100))
+            self._wm_fontsize.setValue(fontsize)
+            self._wm_angle.setValue(angle)
+            for w in (self._wm_x, self._wm_y, self._wm_fontsize, self._wm_angle):
+                w.blockSignals(False)
+
+    def _on_wm_clicked(self, idx: int) -> None:
+        self._wm_list.setCurrentRow(idx)
+
+    def _browse_wm_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "選擇圖片", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp)")
+        if not path:
+            return
+        self._status.showMessage("處理圖片中…")
+        QApplication.processEvents()
+        pixmap, img_bytes, err = _process_watermark_image(path)
+        if err:
+            self._status.showMessage(err)
+            return
+        idx = self._wm_active_idx
+        if 0 <= idx < len(self._watermarks):
+            wm = self._watermarks[idx]
+            wm["image_path"]   = path
+            wm["image_pixmap"] = pixmap
+            wm["image_bytes"]  = img_bytes
+            self._wm_image_path_label.setText(os.path.basename(path))
+            self._refresh_wm_list_item(idx)
+            self._page_view.set_watermarks(self._watermarks, idx)
+            self._status.showMessage(f"圖片已載入: {os.path.basename(path)}")
 
     # ------------------------------------------------------------------
     # File operations
@@ -789,7 +1155,6 @@ class MainWindow(QMainWindow):
         if self._doc is None:
             self._status.showMessage("No document open.")
             return
-
         path, _ = QFileDialog.getSaveFileName(
             self, "Export PDF", "", "PDF Files (*.pdf)")
         if not path:
@@ -802,25 +1167,55 @@ class MainWindow(QMainWindow):
         buf.seek(0)
         doc2 = fitz.open("pdf", buf.read())
 
-        watermark  = self._wm_input.text().strip()
-        wm_fontsize = self._wm_fontsize.value()
-        wm_x_pct   = self._wm_x.value() / 100.0
-        wm_y_pct   = self._wm_y.value() / 100.0
-        wm_angle   = self._wm_angle.value()
-
         for page_num in range(len(doc2)):
             page = doc2[page_num]
+            pr   = page.rect
 
-            if watermark:
-                pr     = page.rect
-                font   = fitz.Font("helv")
-                text_w = font.text_length(watermark, fontsize=wm_fontsize)
-                anchor = fitz.Point(pr.width * wm_x_pct, pr.height * wm_y_pct)
-                start  = fitz.Point(anchor.x - text_w / 2, anchor.y)
-                tw = fitz.TextWriter(page.rect)
-                tw.append(start, watermark, fontsize=wm_fontsize, font=font)
-                tw.write_text(page, color=(0.75, 0.75, 0.75),
-                              morph=(anchor, fitz.Matrix(wm_angle)))
+            for wm in self._watermarks:
+                if not wm.get("visible", True):
+                    continue
+
+                if wm["type"] == "text":
+                    if not wm["text"].strip():
+                        continue
+                    font   = fitz.Font("helv")
+                    fs     = wm["fontsize"]
+                    text_w = font.text_length(wm["text"], fontsize=fs)
+                    anchor = fitz.Point(pr.width  * wm["x_pct"],
+                                        pr.height * wm["y_pct"])
+                    start  = fitz.Point(anchor.x - text_w / 2, anchor.y)
+                    tw = fitz.TextWriter(pr)
+                    tw.append(start, wm["text"], fontsize=fs, font=font)
+                    tw.write_text(page,
+                                  color=(0.6, 0.6, 0.6),
+                                  opacity=0.35,
+                                  morph=(anchor, fitz.Matrix(wm["angle"])),
+                                  overlay=True)
+
+                elif wm["type"] == "image":
+                    img_bytes = wm.get("image_bytes")
+                    if not img_bytes:
+                        continue
+                    pm = wm.get("image_pixmap")
+                    h  = float(wm["fontsize"])
+                    w  = h * (pm.width() / pm.height()) if (pm and pm.height()) else h
+                    # Pre-rotate image for arbitrary angles
+                    angle = wm["angle"]
+                    data  = _rotate_image_bytes(img_bytes, angle)
+                    # Recalculate bounding box for rotated image
+                    try:
+                        from PIL import Image as _PIL
+                        rotated = _PIL.open(io.BytesIO(data))
+                        rot_w, rot_h = rotated.size
+                        if rot_h > 0:
+                            w = h * rot_w / rot_h
+                    except Exception:
+                        pass
+                    cx = pr.width  * wm["x_pct"]
+                    cy = pr.height * wm["y_pct"]
+                    rect = fitz.Rect(cx - w / 2, cy - h / 2,
+                                     cx + w / 2, cy + h / 2)
+                    page.insert_image(rect, stream=data, overlay=True)
 
             for hl in self._highlights:
                 if hl["page"] == page_num:
@@ -860,8 +1255,7 @@ class MainWindow(QMainWindow):
             page, self._current_page, self._zoom, self._highlights)
         self._page_label.setText(
             f"  {self._current_page + 1} / {len(self._doc)}  ")
-        # Reapply watermark overlay after re-render
-        self._update_wm_preview()
+        self._page_view.set_watermarks(self._watermarks, self._wm_active_idx)
 
     # ------------------------------------------------------------------
     # Selection → context menu
@@ -869,10 +1263,10 @@ class MainWindow(QMainWindow):
 
     def _on_selection(self, text: str, word_rects: list,
                       global_pos: QPoint) -> None:
-        menu    = QMenu(self)
-        hl_act  = menu.addAction("Highlight")
-        tr_act  = menu.addAction("Translate")
-        chosen  = menu.exec(global_pos)
+        menu   = QMenu(self)
+        hl_act = menu.addAction("Highlight")
+        tr_act = menu.addAction("Translate")
+        chosen = menu.exec(global_pos)
         if chosen == hl_act:
             self._add_highlights(word_rects, text)
         elif chosen == tr_act:
@@ -898,10 +1292,6 @@ class MainWindow(QMainWindow):
         item.setData(Qt.ItemDataRole.UserRole,
                      len(self._highlights) - len(rects))
         self._hl_list.addItem(item)
-
-    # ------------------------------------------------------------------
-    # Sidebar interactions
-    # ------------------------------------------------------------------
 
     def _jump_to_highlight(self, item: QListWidgetItem) -> None:
         idx = item.data(Qt.ItemDataRole.UserRole)
@@ -983,6 +1373,14 @@ class MainWindow(QMainWindow):
                 color: #d4d4d4;
             }
             QLabel { color: #d4d4d4; }
+            QComboBox {
+                background-color: #3c3c3c; border: 1px solid #555;
+                border-radius: 3px; padding: 3px; color: #d4d4d4;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2d2d2d; color: #d4d4d4;
+                selection-background-color: #094771;
+            }
         """)
 
 
@@ -994,7 +1392,6 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("PDF Editor")
 
-    # Ensure CJK characters render correctly by adding a fallback font
     default_font = app.font()
     default_font.setFamilies(["Ubuntu", "Microsoft JhengHei", "sans-serif"])
     app.setFont(default_font)

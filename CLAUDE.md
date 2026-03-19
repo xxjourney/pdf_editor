@@ -35,9 +35,47 @@ This repo contains **two independent PDF editors** that share no code:
 - Self-contained PyQt6 application, no server required.
 - **Key classes**:
   - `PageView(QWidget)` — renders a PDF page via PyMuPDF into a QPixmap (HiDPI-aware using `devicePixelRatioF`). Handles word-level text selection (hit-test against `page.get_text("words")`) and watermark overlay (drag to move/resize/rotate via `QTransform`).
-  - `MainWindow(QMainWindow)` — owns the document, highlights list, and all sidebar state. Coordinates between `PageView` signals and sidebar widgets.
+  - `MainWindow(QMainWindow)` — owns the document, highlights list, watermarks list, and all sidebar state. Coordinates between `PageView` signals and sidebar widgets.
   - `TranslateDialog(QDialog)` — calls `translate()` synchronously on open; calls `QApplication.processEvents()` first so "Translating…" is visible.
   - `translate()` — free function supporting Gemini, DeepL, and Google Translate (REST). Uses `google-genai` SDK (`google.genai.Client`) for Gemini, **not** the old `google-generativeai` SDK.
+
+### Watermark system (Qt app)
+
+Multiple watermarks are supported. Each watermark is a `dict`:
+
+```python
+{
+    "type":         "text" | "image",
+    "text":         str,           # text content (type=text)
+    "image_path":   str,           # original file path (type=image)
+    "image_pixmap": QPixmap|None,  # processed pixmap for display
+    "image_bytes":  bytes|None,    # PNG bytes for PDF export
+    "x_pct":        float,         # anchor X as fraction of page width
+    "y_pct":        float,         # anchor Y as fraction of page height
+    "fontsize":     int,           # pt (text size, or display height for image)
+    "angle":        int,           # CCW degrees
+    "visible":      bool,          # toggled via checkbox in list
+}
+```
+
+**Rendering order** (PageView.paintEvent):
+1. PDF page pixmap (SourceOver)
+2. Watermarks — text uses `CompositionMode_Multiply` so dark ink is unaffected; image uses SourceOver (transparency baked in)
+3. Highlights / selection
+4. Active-watermark bounding box + drag handles (SourceOver, always on top)
+
+**Image processing** (`_process_watermark_image`):
+- Requires Pillow (`pip install Pillow`)
+- Background removal: uses `rembg` if installed AND `USE_REMBG = True` (top of file), otherwise threshold-based (lightness > 200 → transparent)
+- Opacity: alpha channel scaled to 35%
+- Stores both `QPixmap` (display) and PNG bytes (export)
+
+**Export** (`_export_pdf`):
+- Text: `TextWriter` + `write_text(..., opacity=0.35, overlay=True)`
+- Image: PIL pre-rotates for arbitrary angles, then `page.insert_image(..., overlay=True)`
+- `overlay=True` is required — `overlay=False` is hidden behind the PDF's own white background fill
+
+**`USE_REMBG` flag** (line ~23): set `False` to skip rembg even when installed; uses threshold-based fallback instead.
 
 ### Coordinate systems
 - PyMuPDF uses PDF points (72 dpi). Zoom factor maps points ↔ screen pixels: `screen_px = pdf_pt × zoom`.

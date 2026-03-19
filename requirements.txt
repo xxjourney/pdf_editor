@@ -8,3 +8,5 @@ google-generativeai
 google-genai
 deepl
 requests
+Pillow
+rembg  # optional: AI-based image background removal (pip install rembg)
