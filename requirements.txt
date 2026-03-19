@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+PyMuPDF
+jinja2
+python-multipart
+PyQt6
+google-generativeai
+google-genai
+deepl
+requests

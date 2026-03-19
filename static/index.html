@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF Editor</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Top bar ── */
+    #toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 16px;
+      background: #181825;
+      border-bottom: 1px solid #313244;
+      flex-shrink: 0;
+    }
+
+    #toolbar h1 { font-size: 1rem; font-weight: 600; color: #cba6f7; margin-right: 8px; }
+
+    button, label.btn {
+      padding: 6px 14px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 500;
+      background: #313244;
+      color: #cdd6f4;
+      transition: background 0.15s;
+    }
+    button:hover, label.btn:hover { background: #45475a; }
+    button.primary { background: #cba6f7; color: #1e1e2e; }
+    button.primary:hover { background: #d0a7f8; }
+    button:disabled { opacity: 0.4; cursor: default; }
+
+    #file-input { display: none; }
+
+    .sep { width: 1px; height: 24px; background: #313244; }
+
+    #page-info { font-size: 0.85rem; color: #a6adc8; }
+
+    /* ── Main layout ── */
+    #main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* ── Sidebar ── */
+    #sidebar {
+      width: 240px;
+      background: #181825;
+      border-right: 1px solid #313244;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      flex-shrink: 0;
+      overflow-y: auto;
+    }
+
+    .panel {
+      padding: 14px;
+      border-bottom: 1px solid #313244;
+    }
+
+    .panel h2 { font-size: 0.78rem; text-transform: uppercase; letter-spacing: .05em; color: #a6adc8; margin-bottom: 10px; }
+
+    #watermark-input {
+      width: 100%;
+      padding: 6px 10px;
+      background: #313244;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      color: #cdd6f4;
+      font-size: 0.85rem;
+      margin-bottom: 8px;
+    }
+
+    #highlight-list { font-size: 0.78rem; color: #a6adc8; }
+    .hl-item {
+      padding: 4px 6px;
+      background: #313244;
+      border-radius: 4px;
+      margin-bottom: 4px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .hl-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px; }
+    .hl-del { cursor: pointer; color: #f38ba8; font-size: 0.9rem; flex-shrink: 0; }
+
+    /* ── Viewer ── */
+    #viewer {
+      flex: 1;
+      overflow: auto;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      padding: 24px;
+      background: #1e1e2e;
+    }
+
+    #canvas-container {
+      position: relative;
+      box-shadow: 0 4px 32px rgba(0,0,0,0.6);
+      line-height: 0;
+    }
+
+    #pdf-canvas {
+      display: block;
+    }
+
+    /* PDF.js text layer */
+    #text-layer {
+      position: absolute;
+      top: 0; left: 0;
+      right: 0; bottom: 0;
+      overflow: hidden;
+      opacity: 1;
+      line-height: 1;
+      pointer-events: auto;
+    }
+
+    /* CRITICAL: transform-origin must be top-left or text floats away */
+    #text-layer span,
+    #text-layer br {
+      color: transparent;
+      position: absolute;
+      white-space: pre;
+      cursor: text;
+      transform-origin: 0% 0%;
+      -webkit-user-select: text;
+      user-select: text;
+    }
+
+    #text-layer ::selection {
+      background: rgba(0, 120, 255, 0.3);
+      color: transparent;
+    }
+
+    /* annotation overlay */
+    #annot-canvas {
+      position: absolute;
+      top: 0; left: 0;
+      pointer-events: none;
+    }
+
+    /* ── Context menu ── */
+    #ctx-menu {
+      position: fixed;
+      background: #313244;
+      border: 1px solid #45475a;
+      border-radius: 8px;
+      padding: 6px;
+      display: none;
+      z-index: 9999;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    #ctx-menu.visible { display: flex; }
+
+    .ctx-btn {
+      background: transparent;
+      color: #cdd6f4;
+      padding: 6px 12px;
+      text-align: left;
+      border-radius: 5px;
+    }
+    .ctx-btn:hover { background: #45475a; }
+
+    /* ── Translation popup ── */
+    #translate-popup {
+      position: fixed;
+      background: #313244;
+      border: 1px solid #89b4fa;
+      border-radius: 8px;
+      padding: 12px 14px;
+      max-width: 300px;
+      font-size: 0.85rem;
+      display: none;
+      z-index: 9999;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    }
+
+    #translate-popup.visible { display: block; }
+    #translate-popup strong { color: #89b4fa; display: block; margin-bottom: 6px; font-size: 0.78rem; }
+    #translate-popup #trans-close {
+      position: absolute; top: 6px; right: 8px;
+      background: none; color: #a6adc8; padding: 2px 6px; font-size: 0.9rem;
+    }
+
+    /* Status bar */
+    #status {
+      padding: 4px 16px;
+      font-size: 0.78rem;
+      color: #a6adc8;
+      background: #181825;
+      border-top: 1px solid #313244;
+      flex-shrink: 0;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Toolbar -->
+<div id="toolbar">
+  <h1>PDF Editor</h1>
+  <label class="btn" for="file-input">開啟 PDF</label>
+  <input type="file" id="file-input" accept=".pdf" />
+  <div class="sep"></div>
+  <button id="prev-btn" disabled>◀ 上一頁</button>
+  <span id="page-info">—</span>
+  <button id="next-btn" disabled>下一頁 ▶</button>
+  <div class="sep"></div>
+  <button id="export-btn" class="primary" disabled>匯出 PDF</button>
+</div>
+
+<!-- Main -->
+<div id="main">
+
+  <!-- Sidebar -->
+  <div id="sidebar">
+    <div class="panel">
+      <h2>浮水印</h2>
+      <input type="text" id="watermark-input" placeholder="浮水印文字…" />
+      <div style="font-size:0.75rem;color:#585b70;">將在匯出時套用至每頁</div>
+    </div>
+    <div class="panel">
+      <h2>螢光標記 <span id="hl-count">(0)</span></h2>
+      <div id="highlight-list"><div style="color:#585b70;font-size:0.78rem;">尚無標記</div></div>
+    </div>
+  </div>
+
+  <!-- PDF Viewer -->
+  <div id="viewer">
+    <div id="canvas-container">
+      <canvas id="pdf-canvas"></canvas>
+      <div id="text-layer"></div>
+      <canvas id="annot-canvas"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- Context menu -->
+<div id="ctx-menu">
+  <button class="ctx-btn" id="ctx-highlight">🖊 螢光標記</button>
+  <button class="ctx-btn" id="ctx-translate">🌐 翻譯</button>
+</div>
+
+<!-- Translation popup -->
+<div id="translate-popup">
+  <button id="trans-close">✕</button>
+  <strong>翻譯結果</strong>
+  <div id="trans-text">—</div>
+</div>
+
+<!-- Status bar -->
+<div id="status" id="status">請開啟 PDF 檔案以開始編輯</div>
+
+<!-- PDF.js from CDN -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
+
+<script>
+  // ── PDF.js setup ──────────────────────────────────────────────
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+  const SCALE = 1.5;
+
+  let pdfDoc     = null;
+  let currentPage = 1;
+  let originalFile = null;
+
+  // highlights: [{page, x, y, width, height, text}]
+  let highlights = [];
+
+  // pending selection info
+  let pendingSelection = null;
+
+  const pdfCanvas  = document.getElementById('pdf-canvas');
+  const annotCanvas = document.getElementById('annot-canvas');
+  const textLayer  = document.getElementById('text-layer');
+  const ctxPdf     = pdfCanvas.getContext('2d');
+  const ctxAnnot   = annotCanvas.getContext('2d');
+  const status     = document.getElementById('status');
+
+  // ── File open ────────────────────────────────────────────────
+  document.getElementById('file-input').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    originalFile = file;
+    const arrayBuffer = await file.arrayBuffer();
+    pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    currentPage = 1;
+    renderPage(currentPage);
+    updatePageUI();
+    document.getElementById('export-btn').disabled = false;
+    setStatus(`已載入：${file.name}  (共 ${pdfDoc.numPages} 頁)`);
+  });
+
+  // ── Page navigation ──────────────────────────────────────────
+  document.getElementById('prev-btn').addEventListener('click', () => {
+    if (currentPage > 1) { currentPage--; renderPage(currentPage); updatePageUI(); }
+  });
+  document.getElementById('next-btn').addEventListener('click', () => {
+    if (pdfDoc && currentPage < pdfDoc.numPages) { currentPage++; renderPage(currentPage); updatePageUI(); }
+  });
+
+  function updatePageUI() {
+    if (!pdfDoc) return;
+    document.getElementById('page-info').textContent = `第 ${currentPage} / ${pdfDoc.numPages} 頁`;
+    document.getElementById('prev-btn').disabled = currentPage <= 1;
+    document.getElementById('next-btn').disabled = currentPage >= pdfDoc.numPages;
+  }
+
+  // ── Render ───────────────────────────────────────────────────
+  async function renderPage(num) {
+    const page     = await pdfDoc.getPage(num);
+    const viewport = page.getViewport({ scale: SCALE });
+
+    // HiDPI fix: render canvas at physical pixel resolution, display at CSS size
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = viewport.width;
+    const cssH = viewport.height;
+
+    // Physical canvas size = CSS size × devicePixelRatio (sharp on 4K/Retina)
+    pdfCanvas.width  = Math.floor(cssW * dpr);
+    pdfCanvas.height = Math.floor(cssH * dpr);
+    pdfCanvas.style.width  = cssW + 'px';
+    pdfCanvas.style.height = cssH + 'px';
+
+    annotCanvas.width  = Math.floor(cssW * dpr);
+    annotCanvas.height = Math.floor(cssH * dpr);
+    annotCanvas.style.width  = cssW + 'px';
+    annotCanvas.style.height = cssH + 'px';
+
+    // Text layer stays in CSS pixels (HTML elements, not canvas)
+    textLayer.style.width  = cssW + 'px';
+    textLayer.style.height = cssH + 'px';
+    textLayer.innerHTML = '';
+
+    // Scale the canvas context to match physical pixels
+    ctxPdf.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Re-create viewport at physical resolution for PDF rendering
+    const hiDpiViewport = page.getViewport({ scale: SCALE * dpr });
+    await page.render({ canvasContext: ctxPdf, viewport: hiDpiViewport }).promise;
+
+    // Text layer — PDF.js 3.x returns a RenderTask with .promise
+    const textContent = await page.getTextContent();
+    const renderTask = pdfjsLib.renderTextLayer({
+      textContent,
+      container: textLayer,
+      viewport,
+      textDivs: [],
+    });
+    // renderTask may be a Promise (older builds) or a RenderTask object
+    await (renderTask.promise ?? renderTask);
+
+    redrawAnnotations();
+  }
+
+  // ── Annotation drawing ───────────────────────────────────────
+  function redrawAnnotations() {
+    const dpr = window.devicePixelRatio || 1;
+    ctxAnnot.clearRect(0, 0, annotCanvas.width, annotCanvas.height);
+    ctxAnnot.fillStyle = 'rgba(255, 255, 0, 0.35)';
+    highlights
+      .filter(h => h.page === currentPage - 1)
+      .forEach(h => {
+        // h coords are in unscaled PDF points; multiply by SCALE*dpr for physical pixels
+        ctxAnnot.fillRect(
+          h.x * SCALE * dpr,
+          h.y * SCALE * dpr,
+          h.width  * SCALE * dpr,
+          h.height * SCALE * dpr,
+        );
+      });
+  }
+
+  // ── Text selection & context menu ────────────────────────────
+  document.addEventListener('mouseup', (e) => {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed) {
+      hideCtxMenu();
+      return;
+    }
+    const text = sel.toString().trim();
+    if (!text) { hideCtxMenu(); return; }
+
+    const range = sel.getRangeAt(0);
+    const rects = range.getClientRects();
+    if (!rects.length) return;
+
+    // Collect bounding box relative to annotCanvas
+    const canvasRect = annotCanvas.getBoundingClientRect();
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const r of rects) {
+      minX = Math.min(minX, r.left);  minY = Math.min(minY, r.top);
+      maxX = Math.max(maxX, r.right); maxY = Math.max(maxY, r.bottom);
+    }
+
+    // Convert to PDF coords (unscaled)
+    pendingSelection = {
+      text,
+      x: (minX - canvasRect.left) / SCALE,
+      y: (minY - canvasRect.top)  / SCALE,
+      width:  (maxX - minX) / SCALE,
+      height: (maxY - minY) / SCALE,
+      page: currentPage - 1,
+    };
+
+    showCtxMenu(e.clientX, e.clientY);
+    e.stopPropagation();
+  });
+
+  document.addEventListener('mousedown', (e) => {
+    if (!e.target.closest('#ctx-menu')) hideCtxMenu();
+    if (!e.target.closest('#translate-popup')) hideTranslatePopup();
+  });
+
+  const ctxMenu = document.getElementById('ctx-menu');
+
+  function showCtxMenu(x, y) {
+    ctxMenu.style.left = x + 'px';
+    ctxMenu.style.top  = y + 'px';
+    ctxMenu.classList.add('visible');
+  }
+
+  function hideCtxMenu() { ctxMenu.classList.remove('visible'); }
+
+  // ── Highlight ────────────────────────────────────────────────
+  document.getElementById('ctx-highlight').addEventListener('click', () => {
+    if (!pendingSelection) return;
+    highlights.push({ ...pendingSelection });
+    redrawAnnotations();
+    updateHighlightList();
+    window.getSelection().removeAllRanges();
+    hideCtxMenu();
+    setStatus(`已新增螢光標記：「${pendingSelection.text.slice(0, 30)}…」`);
+    pendingSelection = null;
+  });
+
+  function updateHighlightList() {
+    const list = document.getElementById('highlight-list');
+    document.getElementById('hl-count').textContent = `(${highlights.length})`;
+    if (!highlights.length) {
+      list.innerHTML = '<div style="color:#585b70;font-size:0.78rem;">尚無標記</div>';
+      return;
+    }
+    list.innerHTML = highlights.map((h, i) => `
+      <div class="hl-item">
+        <span title="${h.text}">第${h.page+1}頁 — ${h.text.slice(0,20)}</span>
+        <span class="hl-del" data-idx="${i}">✕</span>
+      </div>`).join('');
+    list.querySelectorAll('.hl-del').forEach(el => {
+      el.addEventListener('click', () => {
+        highlights.splice(+el.dataset.idx, 1);
+        updateHighlightList();
+        redrawAnnotations();
+      });
+    });
+  }
+
+  // ── Translate ────────────────────────────────────────────────
+  document.getElementById('ctx-translate').addEventListener('click', async () => {
+    if (!pendingSelection) return;
+    const text = pendingSelection.text;
+    hideCtxMenu();
+    setStatus('翻譯中…');
+
+    try {
+      const res = await fetch('/api/translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      const data = await res.json();
+      showTranslatePopup(data.translated);
+      setStatus('翻譯完成');
+    } catch (err) {
+      setStatus('翻譯失敗：' + err.message);
+    }
+  });
+
+  const translatePopup = document.getElementById('translate-popup');
+  const transText = document.getElementById('trans-text');
+
+  function showTranslatePopup(text) {
+    transText.textContent = text;
+    // Position near centre of viewport
+    translatePopup.style.left = '50%';
+    translatePopup.style.top  = '50%';
+    translatePopup.style.transform = 'translate(-50%, -50%)';
+    translatePopup.classList.add('visible');
+  }
+
+  function hideTranslatePopup() { translatePopup.classList.remove('visible'); }
+
+  document.getElementById('trans-close').addEventListener('click', hideTranslatePopup);
+
+  // ── Export ───────────────────────────────────────────────────
+  document.getElementById('export-btn').addEventListener('click', async () => {
+    if (!originalFile) return;
+    const watermark = document.getElementById('watermark-input').value.trim();
+    setStatus('正在匯出 PDF…');
+
+    const formData = new FormData();
+    formData.append('file', originalFile);
+    formData.append('highlights', JSON.stringify(highlights));
+    formData.append('watermark', watermark);
+
+    try {
+      const res = await fetch('/api/export', { method: 'POST', body: formData });
+      if (!res.ok) throw new Error(await res.text());
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href     = url;
+      a.download = 'edited.pdf';
+      a.click();
+      URL.revokeObjectURL(url);
+      setStatus('PDF 匯出成功！');
+    } catch (err) {
+      setStatus('匯出失敗：' + err.message);
+    }
+  });
+
+  // ── Utilities ────────────────────────────────────────────────
+  function setStatus(msg) {
+    document.getElementById('status').textContent = msg;
+  }
+</script>
+</body>
+</html>
