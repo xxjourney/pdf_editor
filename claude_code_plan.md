@@ -8,6 +8,7 @@ This document provides a step-by-step implementation plan designed to be execute
 
 ## Prerequisites
 Before starting, ensure you are in the target directory for the project: `/home/brianhsu/pdf_editor`
+You will also need a Gemini API Key. Go to [Google AI Studio](https://aistudio.google.com/app/apikey) to get one.
 
 ## Execution Step 1: Project Initialization and Backend Setup
 
@@ -17,10 +18,11 @@ Please initialize a new Python-based web application for a PDF Editor in the cur
 Requirements:
 1. Use FastAPI as the web framework.
 2. Set up a virtual environment (`python -m venv venv`) and activate it (or create instructions for me to activate it).
-3. Create a `requirements.txt` containing at least `fastapi`, `uvicorn`, `PyMuPDF` (for PDF manipulation), and `jinja2` (if needed for templating, though static files might be enough).
-4. Create a basic `main.py` that serves a static HTML page (`index.html`) from a `static/` directory.
-5. Create an empty `static/index.html` file.
-6. Provide the command to run the development server.
+3. Create a `requirements.txt` containing at least `fastapi`, `uvicorn`, `PyMuPDF` (for PDF manipulation), `jinja2`, `google-genai` (for Gemini API), and `python-dotenv`.
+4. Create a `.env` file (and add it to `.gitignore`) to store environment variables. Add a placeholder `GEMINI_API_KEY=your_key_here` to it.
+5. Create a basic `main.py` that serves a static HTML page (`index.html`) from a `static/` directory.
+6. Create an empty `static/index.html` file.
+7. Provide the command to run the development server.
 ```
 
 ## Execution Step 2: Frontend Setup with PDF.js
@@ -48,17 +50,19 @@ Let's add the ability to select text and highlight it (fluorescent pen) on the f
 6. Store these highlight coordinates in a JavaScript array/state object so we can send them to the backend later.
 ```
 
-## Execution Step 4: Implement Text Translation UI and Backend Stub
+## Execution Step 4: Implement Text Translation UI and Gemini API Backend
 
 **Prompt to give Claude:**
 ```text
-Now, let's implement the translation feature.
+Now, let's implement the translation feature using the Gemini API.
 1. Add a "Translate" option to the text selection context menu we created in the previous step.
 2. When "Translate" is clicked, extract the actual text string that was selected.
 3. Create a new FastAPI endpoint `POST /api/translate` in `main.py` that accepts a JSON payload with `{"text": "..."}`.
-4. For now, just have the backend return a mock translation (e.g., return "TRANSLATED: " + original_text). We'll add a real API later.
-5. In the frontend JavaScript, make a `fetch` call to this `/api/translate` endpoint when the "Translate" button is clicked.
-6. Display the returned translated text in a small popup or tooltip near the selected text.
+4. In `main.py`, use the `python-dotenv` package to load the `.env` file.
+5. Initialize the `google-genai` client (it will automatically pick up `GEMINI_API_KEY`).
+6. In the `/api/translate` endpoint, call the Gemini API using the `gemini-2.5-flash` model to translate the requested text into Traditional Chinese (or English if it's already Chinese). Return the translated string.
+7. In the frontend JavaScript, make a `fetch` call to this `/api/translate` endpoint when the "Translate" button is clicked.
+8. Display the returned translated text in a small popup or tooltip near the selected text.
 ```
 
 ## Execution Step 5: Implement Watermarking UI
@@ -91,12 +95,11 @@ This is the core backend logic step.
 6. Return the modified PDF as a file download response to the frontend, so the user's browser prompts them to save the new `.pdf` file.
 ```
 
-## Execution Step 7: Refinement and Real Translation (Optional)
+## Execution Step 7: Refinement
 
 **Prompt to give Claude:**
 ```text
 Review the code for any edge cases.
 1. Ensure coordinate mapping between the `PDF.js` canvas (which might be scaled) and the backend `PyMuPDF` coordinate system (usually points, 72 dpi) is accurate for the highlights. This is a common issue.
-2. If you have a preferred translation API (like Google Cloud Translation or DeepL), please replace the mock translation in `POST /api/translate` with actual API calls. (Make sure to ask me for API keys if needed, don't hardcode them).
-3. Add basic CSS styling to make the application look clean and modern.
+2. Add basic CSS styling to make the application look clean and modern.
 ```
