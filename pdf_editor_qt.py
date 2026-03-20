@@ -9,14 +9,14 @@ from PyQt6.QtCore import (
     QPoint, QPointF, QRectF, Qt, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QAction, QColor, QFont, QFontMetricsF, QImage, QPainter,
+    QAction, QColor, QFont, QFontMetrics, QFontMetricsF, QImage, QPainter,
     QPen, QPixmap, QTransform,
 )
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMenu,
-    QPushButton, QScrollArea, QSpinBox, QSplitter,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QProgressDialog, QPushButton, QScrollArea, QSpinBox, QSplitter,
     QStatusBar, QTextEdit, QToolBar, QVBoxLayout, QWidget,
 )
 
@@ -39,17 +39,18 @@ def _default_watermark() -> dict:
         "text":          "",
         "image_path":    "",
         "image_pixmap":  None,     # QPixmap for display
-        "image_bytes":   None,     # PNG bytes for export
+        "image_bytes":   None,     # PNG bytes for export (full opacity; faded at paint/export time)
         "x_pct":         0.5,
         "y_pct":         0.5,
         "fontsize":      48,       # pt (text) or display height in pt (image)
         "angle":         45,
+        "opacity":       0.35,
         "visible":       True,
     }
 
 
 def _process_watermark_image(path: str,
-                              opacity: float = 0.35) -> tuple:
+                              opacity: float = 1.0) -> tuple:
     """Load image, remove background, fade.
     Returns (QPixmap, png_bytes, error_str).  error_str is None on success."""
     try:
@@ -135,6 +136,7 @@ def _rotate_image_bytes(img_bytes: bytes, angle: int) -> bytes:
 class PageView(QWidget):
     selectionReady = pyqtSignal(str, list, QPoint)
     zoomRequested  = pyqtSignal(int)
+    pageRequested  = pyqtSignal(int)   # +1 = next page, -1 = prev page
     wmChanged      = pyqtSignal(int, float, float, int, int)  # idx,x,y,fs,ang
     wmClicked      = pyqtSignal(int)
 
@@ -278,7 +280,7 @@ class PageView(QWidget):
         # Multiply: text "tints" light areas but never covers dark ink
         painter.setCompositionMode(
             QPainter.CompositionMode.CompositionMode_Multiply)
-        painter.setOpacity(1.0)
+        painter.setOpacity(wm.get("opacity", 0.35))
         painter.setFont(self._wm_qfont_for(wm))
         painter.setPen(QColor(160, 160, 160))
         painter.drawText(
@@ -300,6 +302,7 @@ class PageView(QWidget):
         painter.rotate(-wm["angle"])
         painter.setCompositionMode(
             QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.setOpacity(wm.get("opacity", 0.35))
         painter.drawPixmap(
             round(-text_w / 2), round(-text_h / 2),
             round(text_w), round(text_h),
@@ -443,7 +446,10 @@ class PageView(QWidget):
                 self.zoomRequested.emit(-1)
             event.accept()
         else:
-            event.ignore()
+            delta = event.angleDelta().y()
+            if delta != 0:
+                self.pageRequested.emit(-1 if delta > 0 else 1)
+            event.ignore()  # let QScrollArea handle in-page scrolling
 
     # ------------------------------------------------------------------
     # Watermark drag
@@ -753,8 +759,16 @@ class MainWindow(QMainWindow):
         prev_act.triggered.connect(self._prev_page)
         toolbar.addAction(prev_act)
 
-        self._page_label = QLabel("  —  ")
-        toolbar.addWidget(self._page_label)
+        self._page_spin = QSpinBox()
+        self._page_spin.setRange(1, 1)
+        self._page_spin.setValue(1)
+        self._page_spin.setMinimumWidth(52)
+        self._page_spin.setToolTip("頁碼 — 直接輸入跳頁")
+        self._page_spin.valueChanged.connect(self._goto_page)
+        toolbar.addWidget(self._page_spin)
+
+        self._page_total_label = QLabel("/ —  ")
+        toolbar.addWidget(self._page_total_label)
 
         next_act = QAction("Next  ▶", self)
         next_act.setShortcut("Right")
@@ -787,13 +801,14 @@ class MainWindow(QMainWindow):
         self._page_view = PageView()
         self._page_view.selectionReady.connect(self._on_selection)
         self._page_view.zoomRequested.connect(self._on_zoom_request)
+        self._page_view.pageRequested.connect(self._on_page_requested)
         self._page_view.wmChanged.connect(self._on_wm_changed)
         self._page_view.wmClicked.connect(self._on_wm_clicked)
         self._scroll.setWidget(self._page_view)
         splitter.addWidget(self._scroll)
 
         sidebar = self._build_sidebar()
-        sidebar.setFixedWidth(240)
+        sidebar.setFixedWidth(260)
         splitter.addWidget(sidebar)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
@@ -806,13 +821,17 @@ class MainWindow(QMainWindow):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
 
         # ---- Watermarks ----
         wm_group = QGroupBox("Watermarks")
         wm_layout = QVBoxLayout(wm_group)
+        wm_layout.setContentsMargins(6, 6, 6, 6)
+        wm_layout.setSpacing(8)
 
         self._wm_list = QListWidget()
-        self._wm_list.setMaximumHeight(110)
+        self._wm_list.setMaximumHeight(150)
+        self._wm_list.setToolTip("選取浮水印以編輯屬性，勾選方塊可切換顯示")
         self._wm_list.currentRowChanged.connect(self._on_wm_list_row_changed)
         self._wm_list.itemChanged.connect(self._on_wm_item_changed)
         wm_layout.addWidget(self._wm_list)
@@ -822,6 +841,7 @@ class MainWindow(QMainWindow):
         add_btn.clicked.connect(self._add_watermark)
         btn_row.addWidget(add_btn)
         del_btn = QPushButton("Delete")
+        del_btn.setObjectName("dangerBtn")
         del_btn.clicked.connect(self._delete_watermark)
         btn_row.addWidget(del_btn)
         wm_layout.addLayout(btn_row)
@@ -862,7 +882,8 @@ class MainWindow(QMainWindow):
         self._wm_image_btn.clicked.connect(self._browse_wm_image)
         is_layout.addWidget(self._wm_image_btn)
         self._wm_image_path_label = QLabel("(未選擇)")
-        self._wm_image_path_label.setWordWrap(True)
+        self._wm_image_path_label.setWordWrap(False)
+        self._wm_image_path_label.setMaximumWidth(220)
         is_layout.addWidget(self._wm_image_path_label)
         props_layout.addWidget(self._wm_image_section)
         self._wm_image_section.setVisible(False)
@@ -876,13 +897,16 @@ class MainWindow(QMainWindow):
         self._wm_fontsize.setRange(6, 300)
         self._wm_fontsize.setValue(48)
         self._wm_fontsize.setSuffix(" pt")
+        self._wm_fontsize.setToolTip("字型大小 (pt) 或圖片顯示高度 (pt)")
         self._wm_fontsize.valueChanged.connect(self._update_active_wm)
-        common.addRow("大小:", self._wm_fontsize)
+        self._wm_size_label = QLabel("字型大小:")
+        common.addRow(self._wm_size_label, self._wm_fontsize)
 
         self._wm_x = QSpinBox()
         self._wm_x.setRange(0, 100)
         self._wm_x.setValue(50)
         self._wm_x.setSuffix(" %")
+        self._wm_x.setToolTip("浮水印水平位置（0% = 左，100% = 右）")
         self._wm_x.valueChanged.connect(self._update_active_wm)
         common.addRow("X:", self._wm_x)
 
@@ -890,6 +914,7 @@ class MainWindow(QMainWindow):
         self._wm_y.setRange(0, 100)
         self._wm_y.setValue(50)
         self._wm_y.setSuffix(" %")
+        self._wm_y.setToolTip("浮水印垂直位置（0% = 上，100% = 下）")
         self._wm_y.valueChanged.connect(self._update_active_wm)
         common.addRow("Y:", self._wm_y)
 
@@ -897,8 +922,17 @@ class MainWindow(QMainWindow):
         self._wm_angle.setRange(-180, 180)
         self._wm_angle.setValue(45)
         self._wm_angle.setSuffix(" °")
+        self._wm_angle.setToolTip("旋轉角度，−180° ～ 180°，正值為逆時針")
         self._wm_angle.valueChanged.connect(self._update_active_wm)
         common.addRow("角度:", self._wm_angle)
+
+        self._wm_opacity = QSpinBox()
+        self._wm_opacity.setRange(10, 100)
+        self._wm_opacity.setValue(35)
+        self._wm_opacity.setSuffix(" %")
+        self._wm_opacity.setToolTip("浮水印不透明度（10% ～ 100%）")
+        self._wm_opacity.valueChanged.connect(self._update_active_wm)
+        common.addRow("不透明:", self._wm_opacity)
 
         props_layout.addLayout(common)
         wm_layout.addWidget(self._wm_props)
@@ -907,8 +941,12 @@ class MainWindow(QMainWindow):
         for w in self._wm_editable_widgets():
             w.setEnabled(False)
 
-        wm_layout.addWidget(
-            QLabel("拖曳頁面可調整位置。\n匯出時套用至每一頁。"))
+        drag_hint = QLabel("拖曳頁面可調整位置。\n匯出時套用至每一頁。")
+        drag_hint.setToolTip(
+            "• 拖曳浮水印本體：移動位置\n"
+            "• 拖曳右側藍色圓點：縮放大小\n"
+            "• 拖曳上方橘色圓點：旋轉角度")
+        wm_layout.addWidget(drag_hint)
         layout.addWidget(wm_group)
 
         # ---- Translation ----
@@ -943,9 +981,11 @@ class MainWindow(QMainWindow):
         hl_group = QGroupBox("Highlights")
         hl_layout = QVBoxLayout(hl_group)
         self._hl_list = QListWidget()
+        self._hl_list.setMaximumHeight(140)
         self._hl_list.itemDoubleClicked.connect(self._jump_to_highlight)
         hl_layout.addWidget(self._hl_list)
         del_hl_btn = QPushButton("Delete Selected")
+        del_hl_btn.setObjectName("dangerBtn")
         del_hl_btn.clicked.connect(self._delete_highlight)
         hl_layout.addWidget(del_hl_btn)
         layout.addWidget(hl_group)
@@ -956,12 +996,14 @@ class MainWindow(QMainWindow):
     def _wm_editable_widgets(self):
         """Widgets to enable/disable based on whether a watermark is selected."""
         return (self._wm_type, self._wm_input, self._wm_image_btn,
-                self._wm_fontsize, self._wm_x, self._wm_y, self._wm_angle)
+                self._wm_fontsize, self._wm_x, self._wm_y, self._wm_angle,
+                self._wm_opacity)
 
     def _wm_signal_widgets(self):
         """Widgets whose signals to block during programmatic value updates."""
         return (self._wm_type, self._wm_input,
-                self._wm_fontsize, self._wm_x, self._wm_y, self._wm_angle)
+                self._wm_fontsize, self._wm_x, self._wm_y, self._wm_angle,
+                self._wm_opacity)
 
     # ------------------------------------------------------------------
     # Translation provider
@@ -1052,6 +1094,7 @@ class MainWindow(QMainWindow):
         is_text = (wm["type"] == "text")
         self._wm_text_section.setVisible(is_text)
         self._wm_image_section.setVisible(not is_text)
+        self._wm_size_label.setText("字型大小:" if is_text else "高度:")
 
         for w in self._wm_signal_widgets():
             w.blockSignals(True)
@@ -1061,12 +1104,15 @@ class MainWindow(QMainWindow):
         self._wm_x.setValue(round(wm["x_pct"] * 100))
         self._wm_y.setValue(round(wm["y_pct"] * 100))
         self._wm_angle.setValue(wm["angle"])
+        self._wm_opacity.setValue(round(wm.get("opacity", 0.35) * 100))
         for w in self._wm_signal_widgets():
             w.blockSignals(False)
 
         path = wm.get("image_path", "")
+        name = os.path.basename(path) if path else "(未選擇)"
         self._wm_image_path_label.setText(
-            os.path.basename(path) if path else "(未選擇)")
+            self._elide_label_text(self._wm_image_path_label, name))
+        self._wm_image_path_label.setToolTip(path if path else "")
 
         self._page_view.set_watermarks(self._watermarks, row)
 
@@ -1074,6 +1120,7 @@ class MainWindow(QMainWindow):
         is_text = (index == 0)
         self._wm_text_section.setVisible(is_text)
         self._wm_image_section.setVisible(not is_text)
+        self._wm_size_label.setText("字型大小:" if is_text else "高度:")
         self._update_active_wm()
 
     def _update_active_wm(self) -> None:
@@ -1081,12 +1128,13 @@ class MainWindow(QMainWindow):
         if idx < 0 or idx >= len(self._watermarks):
             return
         wm = self._watermarks[idx]
-        wm["type"]    = "text" if self._wm_type.currentIndex() == 0 else "image"
-        wm["text"]    = self._wm_input.text()
+        wm["type"]     = "text" if self._wm_type.currentIndex() == 0 else "image"
+        wm["text"]     = self._wm_input.text()
         wm["fontsize"] = self._wm_fontsize.value()
-        wm["x_pct"]   = self._wm_x.value() / 100.0
-        wm["y_pct"]   = self._wm_y.value() / 100.0
-        wm["angle"]   = self._wm_angle.value()
+        wm["x_pct"]    = self._wm_x.value() / 100.0
+        wm["y_pct"]    = self._wm_y.value() / 100.0
+        wm["angle"]    = self._wm_angle.value()
+        wm["opacity"]  = self._wm_opacity.value() / 100.0
         self._refresh_wm_list_item(idx)
         self._page_view.set_watermarks(self._watermarks, idx)
 
@@ -1122,7 +1170,7 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         pixmap, img_bytes, err = _process_watermark_image(path)
         if err:
-            self._status.showMessage(err)
+            self._status.showMessage(err, 4000)
             return
         idx = self._wm_active_idx
         if 0 <= idx < len(self._watermarks):
@@ -1130,10 +1178,13 @@ class MainWindow(QMainWindow):
             wm["image_path"]   = path
             wm["image_pixmap"] = pixmap
             wm["image_bytes"]  = img_bytes
-            self._wm_image_path_label.setText(os.path.basename(path))
+            name = os.path.basename(path)
+            self._wm_image_path_label.setText(
+                self._elide_label_text(self._wm_image_path_label, name))
+            self._wm_image_path_label.setToolTip(path)
             self._refresh_wm_list_item(idx)
             self._page_view.set_watermarks(self._watermarks, idx)
-            self._status.showMessage(f"圖片已載入: {os.path.basename(path)}")
+            self._status.showMessage(f"圖片已載入: {name}", 4000)
 
     # ------------------------------------------------------------------
     # File operations
@@ -1166,14 +1217,33 @@ class MainWindow(QMainWindow):
         self._doc.save(buf)
         buf.seek(0)
         doc2 = fitz.open("pdf", buf.read())
+        total = len(doc2)
 
-        for page_num in range(len(doc2)):
+        progress = QProgressDialog("準備中…", "取消", 0, total + 1, self)
+        progress.setWindowTitle("匯出 PDF")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        QApplication.processEvents()
+
+        for page_num in range(total):
+            if progress.wasCanceled():
+                doc2.close()
+                self._status.showMessage("匯出已取消。", 3000)
+                return
+
+            progress.setLabelText(f"處理第 {page_num + 1} / {total} 頁…")
+            progress.setValue(page_num + 1)
+            QApplication.processEvents()
+
             page = doc2[page_num]
             pr   = page.rect
 
             for wm in self._watermarks:
                 if not wm.get("visible", True):
                     continue
+
+                opacity = wm.get("opacity", 0.35)
 
                 if wm["type"] == "text":
                     if not wm["text"].strip():
@@ -1188,7 +1258,7 @@ class MainWindow(QMainWindow):
                     tw.append(start, wm["text"], fontsize=fs, font=font)
                     tw.write_text(page,
                                   color=(0.6, 0.6, 0.6),
-                                  opacity=0.35,
+                                  opacity=opacity,
                                   morph=(anchor, fitz.Matrix(wm["angle"])),
                                   overlay=True)
 
@@ -1202,13 +1272,20 @@ class MainWindow(QMainWindow):
                     # Pre-rotate image for arbitrary angles
                     angle = wm["angle"]
                     data  = _rotate_image_bytes(img_bytes, angle)
-                    # Recalculate bounding box for rotated image
+                    # Apply opacity to alpha channel
                     try:
                         from PIL import Image as _PIL
-                        rotated = _PIL.open(io.BytesIO(data))
+                        import numpy as _np
+                        rotated = _PIL.open(io.BytesIO(data)).convert("RGBA")
                         rot_w, rot_h = rotated.size
                         if rot_h > 0:
                             w = h * rot_w / rot_h
+                        arr = _np.array(rotated, dtype=_np.float32)
+                        arr[:, :, 3] *= opacity
+                        rotated = _PIL.fromarray(arr.astype(_np.uint8))
+                        buf = io.BytesIO()
+                        rotated.save(buf, format="PNG")
+                        data = buf.getvalue()
                     except Exception:
                         pass
                     cx = pr.width  * wm["x_pct"]
@@ -1221,9 +1298,17 @@ class MainWindow(QMainWindow):
                 if hl["page"] == page_num:
                     page.add_highlight_annot(hl["rect"]).update()
 
+        progress.setLabelText("儲存檔案…")
+        progress.setValue(total + 1)
+        QApplication.processEvents()
+
         doc2.save(path, garbage=4, deflate=True)
         doc2.close()
-        self._status.showMessage(f"Exported to: {path}")
+        progress.close()
+        self._status.showMessage(f"Exported to: {path}", 5000)
+        QMessageBox.information(
+            self, "匯出完成",
+            f"PDF 已成功匯出至：\n{path}")
 
     # ------------------------------------------------------------------
     # Navigation
@@ -1239,6 +1324,24 @@ class MainWindow(QMainWindow):
             self._current_page += 1
             self._render_current_page()
 
+    def _on_page_requested(self, direction: int) -> None:
+        """Flip page when wheel reaches the top or bottom of the scroll area."""
+        if self._doc is None:
+            return
+        sb = self._scroll.verticalScrollBar()
+        if direction > 0:
+            # Scrolling down — flip to next page only at the bottom
+            if sb.value() >= sb.maximum():
+                self._next_page()
+                sb.setValue(0)
+        else:
+            # Scrolling up — flip to prev page only at the top
+            if sb.value() <= sb.minimum():
+                self._prev_page()
+                # Defer scroll-to-bottom so the new page has time to lay out
+                from PyQt6.QtCore import QTimer
+                QTimer.singleShot(0, lambda: sb.setValue(sb.maximum()))
+
     def _change_zoom(self, value: float) -> None:
         self._zoom = value
         self._render_current_page()
@@ -1247,14 +1350,25 @@ class MainWindow(QMainWindow):
         new = round(self._zoom_spin.value() * 4 + direction) / 4
         self._zoom_spin.setValue(max(0.25, min(4.0, new)))
 
+    def _goto_page(self, page_num: int) -> None:
+        if self._doc is None:
+            return
+        target = page_num - 1
+        if 0 <= target < len(self._doc) and target != self._current_page:
+            self._current_page = target
+            self._render_current_page()
+
     def _render_current_page(self) -> None:
         if self._doc is None:
             return
         page = self._doc[self._current_page]
         self._page_view.set_page(
             page, self._current_page, self._zoom, self._highlights)
-        self._page_label.setText(
-            f"  {self._current_page + 1} / {len(self._doc)}  ")
+        self._page_spin.blockSignals(True)
+        self._page_spin.setRange(1, len(self._doc))
+        self._page_spin.setValue(self._current_page + 1)
+        self._page_spin.blockSignals(False)
+        self._page_total_label.setText(f"/ {len(self._doc)}  ")
         self._page_view.set_watermarks(self._watermarks, self._wm_active_idx)
 
     # ------------------------------------------------------------------
@@ -1325,6 +1439,15 @@ class MainWindow(QMainWindow):
     # Dark theme
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _elide_label_text(label: QLabel, text: str) -> str:
+        """Return text elided with '…' to fit inside label's maximum width."""
+        fm = QFontMetrics(label.font())
+        max_w = label.maximumWidth()
+        if max_w <= 0:
+            max_w = 200
+        return fm.elidedText(text, Qt.TextElideMode.ElideRight, max_w - 4)
+
     def _apply_dark_theme(self) -> None:
         QApplication.instance().setStyleSheet("""
             QMainWindow, QWidget {
@@ -1377,10 +1500,20 @@ class MainWindow(QMainWindow):
                 background-color: #3c3c3c; border: 1px solid #555;
                 border-radius: 3px; padding: 3px; color: #d4d4d4;
             }
+            QComboBox::drop-down { border: none; width: 18px; }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid #aaa;
+                width: 0; height: 0;
+            }
             QComboBox QAbstractItemView {
                 background-color: #2d2d2d; color: #d4d4d4;
                 selection-background-color: #094771;
             }
+            QPushButton#dangerBtn { color: #f48771; }
+            QPushButton#dangerBtn:hover { background-color: #5a2a2a; }
         """)
 
 

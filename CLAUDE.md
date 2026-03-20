@@ -34,7 +34,7 @@ This repo contains **two independent PDF editors** that share no code:
 ### 2. Native Qt desktop app (`pdf_editor_qt.py`)
 - Self-contained PyQt6 application, no server required.
 - **Key classes**:
-  - `PageView(QWidget)` — renders a PDF page via PyMuPDF into a QPixmap (HiDPI-aware using `devicePixelRatioF`). Handles word-level text selection (hit-test against `page.get_text("words")`) and watermark overlay (drag to move/resize/rotate via `QTransform`).
+  - `PageView(QWidget)` — renders a PDF page via PyMuPDF into a QPixmap (HiDPI-aware using `devicePixelRatioF`). Handles word-level text selection (hit-test against `page.get_text("words")`) and watermark overlay (drag to move/resize/rotate via `QTransform`). Emits `pageRequested(int)` on plain wheel scroll for boundary-based page flipping.
   - `MainWindow(QMainWindow)` — owns the document, highlights list, watermarks list, and all sidebar state. Coordinates between `PageView` signals and sidebar widgets.
   - `TranslateDialog(QDialog)` — calls `translate()` synchronously on open; calls `QApplication.processEvents()` first so "Translating…" is visible.
   - `translate()` — free function supporting Gemini, DeepL, and Google Translate (REST). Uses `google-genai` SDK (`google.genai.Client`) for Gemini, **not** the old `google-generativeai` SDK.
@@ -48,12 +48,13 @@ Multiple watermarks are supported. Each watermark is a `dict`:
     "type":         "text" | "image",
     "text":         str,           # text content (type=text)
     "image_path":   str,           # original file path (type=image)
-    "image_pixmap": QPixmap|None,  # processed pixmap for display
-    "image_bytes":  bytes|None,    # PNG bytes for PDF export
+    "image_pixmap": QPixmap|None,  # processed pixmap for display (opacity=1.0, bg removed)
+    "image_bytes":  bytes|None,    # PNG bytes for export (opacity=1.0; faded at paint/export time)
     "x_pct":        float,         # anchor X as fraction of page width
     "y_pct":        float,         # anchor Y as fraction of page height
     "fontsize":     int,           # pt (text size, or display height for image)
     "angle":        int,           # CCW degrees
+    "opacity":      float,         # 0.10–1.00, default 0.35; controlled via painter/write_text
     "visible":      bool,          # toggled via checkbox in list
 }
 ```
@@ -67,13 +68,20 @@ Multiple watermarks are supported. Each watermark is a `dict`:
 **Image processing** (`_process_watermark_image`):
 - Requires Pillow (`pip install Pillow`)
 - Background removal: uses `rembg` if installed AND `USE_REMBG = True` (top of file), otherwise threshold-based (lightness > 200 → transparent)
-- Opacity: alpha channel scaled to 35%
+- Stores pixmap and bytes at **opacity=1.0** (no fade baked in); opacity is applied at paint time via `painter.setOpacity()` and at export time by scaling the alpha channel with numpy
 - Stores both `QPixmap` (display) and PNG bytes (export)
 
 **Export** (`_export_pdf`):
-- Text: `TextWriter` + `write_text(..., opacity=0.35, overlay=True)`
-- Image: PIL pre-rotates for arbitrary angles, then `page.insert_image(..., overlay=True)`
+- Shows `QProgressDialog` (per-page progress, cancelable) while processing
+- Text: `TextWriter` + `write_text(..., opacity=wm["opacity"], overlay=True)`
+- Image: PIL pre-rotates for arbitrary angles, scales alpha channel by `wm["opacity"]`, then `page.insert_image(..., overlay=True)`
 - `overlay=True` is required — `overlay=False` is hidden behind the PDF's own white background fill
+- On success shows `QMessageBox.information` completion dialog
+
+**Page navigation**:
+- Toolbar page label replaced with `QSpinBox` — type a number and press Enter to jump directly
+- Mouse wheel (plain): flips pages at scroll boundaries; in-page scrolling still works when page overflows viewport
+- Mouse wheel (Ctrl): zoom in/out
 
 **`USE_REMBG` flag** (line ~23): set `False` to skip rembg even when installed; uses threshold-based fallback instead.
 

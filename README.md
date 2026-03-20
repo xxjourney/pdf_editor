@@ -6,19 +6,20 @@ A PDF editor with two independent implementations: a **FastAPI web app** and a *
 
 ### Native Qt Desktop App (`pdf_editor_qt.py`)
 - Open and navigate multi-page PDFs
+- **Page navigation**: toolbar SpinBox for direct page jump; mouse wheel flips pages at scroll boundaries (Ctrl+wheel to zoom)
 - Word-level text selection with highlight and translate actions
 - **Multiple watermarks** — text or image, each independently configurable
 - Watermark drag-to-reposition, resize handle, rotate handle on canvas
-- Export PDF with all highlights and watermarks applied
+- Export PDF with progress bar (cancelable) and completion dialog
 - Dark theme UI
 
 #### Watermark features
 - Add/delete multiple watermarks via sidebar list
-- Per-watermark **visibility checkbox**
+- Per-watermark **visibility checkbox** and **opacity control** (10–100%, default 35%)
 - **Text watermarks**: configurable text, font size, position, angle
-- **Image watermarks**: load PNG/JPG, automatic background removal, auto-fade to 35% opacity
+- **Image watermarks**: load PNG/JPG, automatic background removal; opacity controlled at paint/export time (not baked into stored bytes)
 - Watermarks rendered using Multiply blend so dark text is never obscured
-- Exported at `opacity=0.35` via PyMuPDF
+- Exported with per-watermark `opacity` via PyMuPDF
 
 #### Translation
 - Providers: Gemini, DeepL, Google Translate, Mock (offline)
